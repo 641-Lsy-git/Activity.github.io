@@ -1,0 +1,1123 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Study Reproduction</title>
+  <style>
+    html, body { margin:0; padding:0; height:100%; overflow:hidden; background:#0b0e14; color:#eaeef7; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; }
+    #app { position:fixed; inset:0; }
+    #ui {
+      position:fixed; top:12px; left:12px; width:360px;
+      background: rgba(18, 22, 32, 0.88);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 12px; padding: 12px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+      backdrop-filter: blur(8px);
+    }
+    #ui h2 { margin:0 0 10px 0; font-size:14px; font-weight:700; letter-spacing:0.3px; color:#cfe0ff; }
+    label { display:block; font-size:12px; margin-top:8px; color:#b8c2d9; }
+    select, button {
+      width:100%; margin-top:6px; padding:8px 10px;
+      border-radius:10px; border: 1px solid rgba(255,255,255,0.14);
+      background: rgba(255,255,255,0.06); color:#eaeef7;
+      outline:none;
+    }
+    button { cursor:pointer; font-weight:600; }
+    button:hover { background: rgba(255,255,255,0.10); }
+    #row { display:flex; gap:8px; margin-top:8px; }
+    #row button { width: 50%; }
+  </style>
+</head>
+<body>
+<div id="app"></div>
+
+<div id="ui">
+  <h2>Study</h2>
+
+  <label>Flow 表示</label>
+  <select id="cond">
+    <option value="2d_straight">2D straight</option>
+    <option value="2d_curve">2D curve</option>
+    <option value="3d_constant">3D constant height</option>
+    <option value="3d_quantity">3D height ∝ quantity</option>
+    <option value="3d_distance" selected>3D height ∝ distance</option>
+    <option value="3d_globe_distance">3D globe (distance)</option>
+  </select>
+
+  <label>Flow 数量</label>
+  <select id="flowCount">
+    <option value="20" selected>20</option>
+    <option value="40">40</option>
+    <option value="80">80</option>
+    <option value="120">120</option>
+  </select>
+
+  <div id="row">
+    <button id="newTrialBtn">New Trial</button>
+  </div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+import { OrbitControls } from 'https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+
+/** =========================
+ *  0) 工具函数
+ *  ========================= */
+
+// Hammer 投影（归一化到 [-1,1]，便于和平面映射统一）
+function hammerProject(latDeg, lonDeg) {
+  const lat = latDeg * Math.PI / 180;
+  const lon = lonDeg * Math.PI / 180;
+  const d = Math.sqrt(1 + Math.cos(lat) * Math.cos(lon/2));
+  const xRaw = (2 * Math.SQRT2 * Math.cos(lat) * Math.sin(lon/2)) / d; // [-2*sqrt(2), 2*sqrt(2)]
+  const yRaw = (Math.SQRT2 * Math.sin(lat)) / d;                         // [-sqrt(2), sqrt(2)]
+  const x = xRaw / (2 * Math.SQRT2); // -> [-1, 1]
+  const y = yRaw / Math.SQRT2;       // -> [-1, 1]
+  return new THREE.Vector3(x, y, 0);
+}
+
+function clamp01(t){ return Math.max(0, Math.min(1, t)); }
+function lerp(a,b,t){ return a + (b-a)*t; }
+function nowMs(){ return performance.now(); }
+
+function fmtMs(ms){
+  const s = ms/1000;
+  return s.toFixed(2) + 's';
+}
+
+// 计算“投影平面上的距离”（用于 height ∝ distance 的 proxy）
+function planarDistance(p0, p1){
+  return p0.clone().sub(p1).length();
+}
+
+// 大圆距离（km），用于严格的 3D distance 条件
+function greatCircleDistanceKm(lat1, lon1, lat2, lon2){
+  const R = 6371;
+  const toRad = Math.PI / 180;
+  const p1 = lat1 * toRad;
+  const p2 = lat2 * toRad;
+  const dLat = (lat2 - lat1) * toRad;
+  const dLon = (lon2 - lon1) * toRad;
+  const a = Math.sin(dLat/2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin(dLon/2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+// 画布纹理：程序化世界底图（同一 Hammer 投影）
+function makeMapTextureCanvas(w=2048, h=1024){
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const g = c.getContext('2d');
+  const rx = w * 0.48;
+  const ry = h * 0.48;
+  const cx = w * 0.5;
+  const cy = h * 0.5;
+
+  function llToXY(lat, lon){
+    const p = hammerProject(lat, lon);
+    return {
+      x: cx + p.x * rx,
+      y: cy - p.y * ry
+    };
+  }
+
+  function drawPolylineLL(points, stroke, width=1, close=false){
+    if(points.length < 2) return;
+    g.beginPath();
+    points.forEach((pt, i)=>{
+      const p = llToXY(pt[0], pt[1]);
+      if(i===0) g.moveTo(p.x, p.y);
+      else g.lineTo(p.x, p.y);
+    });
+    if(close) g.closePath();
+    g.strokeStyle = stroke;
+    g.lineWidth = width;
+    g.stroke();
+  }
+
+  function drawLand(poly, fill, stroke){
+    g.beginPath();
+    poly.forEach((pt, i)=>{
+      const p = llToXY(pt[0], pt[1]);
+      if(i===0) g.moveTo(p.x, p.y);
+      else g.lineTo(p.x, p.y);
+    });
+    g.closePath();
+    g.fillStyle = fill;
+    g.fill();
+    g.strokeStyle = stroke;
+    g.lineWidth = 2;
+    g.stroke();
+  }
+
+  // outside
+  g.fillStyle = '#07101a';
+  g.fillRect(0,0,w,h);
+
+  // clip to Hammer boundary
+  g.save();
+  g.beginPath();
+  g.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+  g.clip();
+
+  // ocean (inside projection)
+  g.fillStyle = '#0a1826';
+  g.fillRect(0,0,w,h);
+  const seaGrad = g.createLinearGradient(0,0,0,h);
+  seaGrad.addColorStop(0,'rgba(120,170,210,0.20)');
+  seaGrad.addColorStop(1,'rgba(4,10,18,0.45)');
+  g.fillStyle = seaGrad;
+  g.fillRect(0,0,w,h);
+
+  // graticule (projected meridians/parallels)
+  g.strokeStyle = 'rgba(190,220,255,0.10)';
+  for (let lon=-180; lon<=180; lon+=15){
+    const pts = [];
+    for(let lat=-89; lat<=89; lat+=2) pts.push([lat, lon]);
+    drawPolylineLL(pts, 'rgba(190,220,255,0.10)', 1, false);
+  }
+  for (let lat=-75; lat<=75; lat+=15){
+    const pts = [];
+    for(let lon=-180; lon<=180; lon+=2) pts.push([lat, lon]);
+    drawPolylineLL(pts, 'rgba(190,220,255,0.10)', 1, false);
+  }
+
+  // major land masses (stylized, low-poly)
+  const landFill = '#2f6b53';
+  const landStroke = 'rgba(220,245,225,0.42)';
+  drawLand([[72,-168],[68,-140],[62,-130],[52,-125],[48,-124],[32,-114],[22,-107],[16,-96],[8,-84],[18,-76],[28,-83],[46,-66],[58,-74],[68,-95],[72,-128]], landFill, landStroke); // North America
+  drawLand([[12,-82],[5,-80],[-5,-76],[-14,-73],[-22,-68],[-34,-63],[-48,-67],[-55,-73],[-52,-60],[-40,-48],[-22,-43],[-8,-50],[2,-57],[8,-66]], landFill, landStroke); // South America
+  drawLand([[72,-52],[78,-40],[82,-20],[78,-24],[72,-40]], '#3a7a61', landStroke); // Greenland
+  drawLand([[36,-10],[44,4],[53,16],[58,32],[60,50],[66,70],[72,92],[71,116],[62,132],[54,140],[47,132],[39,120],[32,112],[26,102],[20,86],[16,66],[26,52],[34,36],[36,18],[32,4]], landFill, landStroke); // Europe + North Asia west
+  drawLand([[78,92],[72,120],[64,144],[56,162],[48,172],[42,158],[36,140],[38,116],[46,100],[58,92]], landFill, landStroke); // East Asia
+  drawLand([[34,-18],[28,-10],[20,6],[8,18],[-2,32],[-12,44],[-22,45],[-32,34],[-34,20],[-28,8],[-18,-4],[-6,-12],[6,-14],[20,-16]], landFill, landStroke); // Africa
+  drawLand([[30,34],[26,44],[24,54],[26,64],[31,58],[34,46]], '#3b7f65', landStroke); // Arabian Peninsula
+  drawLand([[20,70],[24,82],[28,92],[24,102],[18,92],[16,80]], '#3b7f65', landStroke); // India
+  drawLand([[12,96],[8,108],[2,118],[-4,126],[-8,132],[-4,140],[2,138],[8,130],[12,118]], '#3b7f65', landStroke); // SE Asia
+  drawLand([[-12,110],[-18,120],[-24,130],[-30,140],[-35,150],[-42,153],[-44,142],[-40,130],[-34,120],[-24,112],[-16,108]], landFill, landStroke); // Australia
+  drawLand([[-66,-180],[-72,-140],[-78,-90],[-82,-40],[-82,10],[-78,60],[-72,120],[-66,180]], '#376f59', landStroke); // Antarctica strip
+
+  g.restore();
+
+  // Hammer boundary + title
+  g.beginPath();
+  g.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+  g.strokeStyle = 'rgba(220,240,255,0.30)';
+  g.lineWidth = 3;
+  g.stroke();
+
+  g.strokeStyle = 'rgba(220,240,255,0.25)';
+  g.lineWidth = 3;
+  g.strokeRect(12,12,w-24,h-24);
+  g.fillStyle = 'rgba(221,237,255,0.9)';
+  g.font = 'bold 34px ui-sans-serif,system-ui';
+  
+
+  return c;
+}
+
+// 把 equirectangular 世界地图重投影到 Hammer 纹理
+function drawHammerFromEquirectImage(img, targetCanvas){
+  const w = targetCanvas.width;
+  const h = targetCanvas.height;
+  const dst = targetCanvas.getContext('2d');
+  const rx = w * 0.48;
+  const ry = h * 0.48;
+  const cx = w * 0.5;
+  const cy = h * 0.5;
+
+  const srcCanvas = document.createElement('canvas');
+  srcCanvas.width = img.naturalWidth;
+  srcCanvas.height = img.naturalHeight;
+  const srcCtx = srcCanvas.getContext('2d');
+  srcCtx.drawImage(img, 0, 0);
+  const src = srcCtx.getImageData(0, 0, srcCanvas.width, srcCanvas.height).data;
+
+  const out = dst.getImageData(0, 0, w, h);
+  const outData = out.data;
+  const SQRT2 = Math.SQRT2;
+  const TWO_PI = Math.PI * 2;
+
+  for(let y=0; y<h; y++){
+    const yn = -(y - cy) / ry;
+    if(Math.abs(yn) > 1) continue;
+    for(let x=0; x<w; x++){
+      const xn = (x - cx) / rx;
+      if((xn*xn + yn*yn) > 1) continue; // outside Hammer boundary ellipse
+
+      const xRaw = xn * (2 * SQRT2);
+      const yRaw = yn * SQRT2;
+      const z2 = 1 - (xRaw*xRaw)/16 - (yRaw*yRaw)/4;
+      if(z2 <= 0) continue;
+      const z = Math.sqrt(z2);
+
+      // inverse Hammer
+      const lat = Math.asin(z * yRaw);
+      const lon = 2 * Math.atan2(z * xRaw, 2 * (2 * z * z - 1));
+      const u = (lon + Math.PI) / TWO_PI;
+      const v = (Math.PI/2 - lat) / Math.PI;
+      if(u < 0 || u > 1 || v < 0 || v > 1) continue;
+
+      const sx = Math.min(srcCanvas.width - 1, Math.max(0, Math.round(u * (srcCanvas.width - 1))));
+      const sy = Math.min(srcCanvas.height - 1, Math.max(0, Math.round(v * (srcCanvas.height - 1))));
+      const si = (sy * srcCanvas.width + sx) * 4;
+      const sa = src[si + 3];
+      if(sa > 10){
+        const di = (y * w + x) * 4;
+        outData[di] = src[si];
+        outData[di + 1] = src[si + 1];
+        outData[di + 2] = src[si + 2];
+        outData[di + 3] = 255;
+      }
+    }
+  }
+
+  dst.putImageData(out, 0, 0);
+
+  // 叠加经纬线（Hammer 投影）
+  function llToXY(lat, lon){
+    const p = hammerProject(lat, lon);
+    return { x: cx + p.x * rx, y: cy - p.y * ry };
+  }
+  function drawPolylineLL(points, stroke, width=1){
+    if(points.length < 2) return;
+    dst.beginPath();
+    points.forEach((pt, i)=>{
+      const p = llToXY(pt[0], pt[1]);
+      if(i===0) dst.moveTo(p.x, p.y);
+      else dst.lineTo(p.x, p.y);
+    });
+    dst.strokeStyle = stroke;
+    dst.lineWidth = width;
+    dst.stroke();
+  }
+  for (let lon=-180; lon<=180; lon+=15){
+    const pts = [];
+    for(let lat=-89; lat<=89; lat+=2) pts.push([lat, lon]);
+    drawPolylineLL(pts, 'rgba(215,235,255,0.16)', 1);
+  }
+  for (let lat=-75; lat<=75; lat+=15){
+    const pts = [];
+    for(let lon=-180; lon<=180; lon+=2) pts.push([lat, lon]);
+    drawPolylineLL(pts, 'rgba(215,235,255,0.16)', 1);
+  }
+
+  // 叠加边界
+  dst.beginPath();
+  dst.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+  dst.strokeStyle = 'rgba(230,240,255,0.35)';
+  dst.lineWidth = 3;
+  dst.stroke();
+}
+
+function loadRealHammerTexture(mapCanvas, mapTex){
+  const urls = [
+    'https://upload.wikimedia.org/wikipedia/commons/thumb/2/23/Blue_Marble_2002.png/2048px-Blue_Marble_2002.png',
+    'https://upload.wikimedia.org/wikipedia/commons/thumb/8/80/World_map_-_low_resolution.svg/2000px-World_map_-_low_resolution.svg.png'
+  ];
+
+  const tryLoad = (idx)=>{
+    if(idx >= urls.length){
+      console.warn('Real map texture failed, keeping procedural fallback.');
+      return;
+    }
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = ()=>{
+      try{
+        const before = mapCanvas.getContext('2d').getImageData(0, 0, mapCanvas.width, mapCanvas.height).data;
+        let beforeSum = 0;
+        for(let i=0; i<before.length; i+=32) beforeSum += before[i] + before[i+1] + before[i+2];
+        drawHammerFromEquirectImage(img, mapCanvas);
+        const after = mapCanvas.getContext('2d').getImageData(0, 0, mapCanvas.width, mapCanvas.height).data;
+        let afterSum = 0;
+        for(let i=0; i<after.length; i+=32) afterSum += after[i] + after[i+1] + after[i+2];
+        if(afterSum < beforeSum * 0.25){
+          throw new Error('Projected map too dark, keep fallback');
+        }
+        mapTex.needsUpdate = true;
+      }catch(err){
+        console.warn('Map reprojection failed:', err);
+        tryLoad(idx + 1);
+      }
+    };
+    img.onerror = ()=>tryLoad(idx + 1);
+    img.src = urls[idx];
+  };
+  tryLoad(0);
+}
+
+/** =========================
+ *  1) 场景初始化
+ *  ========================= */
+const container = document.getElementById('app');
+const scene = new THREE.Scene();
+scene.fog = new THREE.Fog(0x0b0e14, 2.0, 8.0);
+
+const camera = new THREE.PerspectiveCamera(50, innerWidth/innerHeight, 0.01, 50);
+camera.position.set(0, 0.9, 2.4);
+
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(2, devicePixelRatio));
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.45;
+container.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.target.set(0, 0.0, 0.0);
+
+// light
+const ambient = new THREE.AmbientLight(0xffffff, 0.55);
+scene.add(ambient);
+const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+dir.position.set(1.2, 2.2, 1.0);
+scene.add(dir);
+const backDir = new THREE.DirectionalLight(0xaec8ff, 0.55);
+backDir.position.set(-1.4, 0.9, -1.2);
+scene.add(backDir);
+const hemi = new THREE.HemisphereLight(0xcfe5ff, 0x243244, 0.7);
+scene.add(hemi);
+
+// map group（用于拖拽移动/旋转）
+const mapGroup = new THREE.Group();
+scene.add(mapGroup);
+
+// map plane
+const MAP_W = 1.0;
+const MAP_H = 0.5;
+
+const mapCanvas = makeMapTextureCanvas(2048, 1024);
+const mapTex = new THREE.CanvasTexture(mapCanvas);
+mapTex.anisotropy = 8;
+mapTex.wrapS = mapTex.wrapT = THREE.ClampToEdgeWrapping;
+loadRealHammerTexture(mapCanvas, mapTex);
+
+const planeGeom = new THREE.PlaneGeometry(MAP_W, MAP_H, 1, 1);
+const planeMat = new THREE.MeshStandardMaterial({
+  map: mapTex,
+  roughness: 1.0,
+  metalness: 0.0,
+  emissive: new THREE.Color(0x0a0d14),
+  emissiveIntensity: 0.15
+});
+const planeMesh = new THREE.Mesh(planeGeom, planeMat);
+planeMesh.rotation.x = -Math.PI/4; // 类似论文中倾斜摆放（便于观察）
+planeMesh.position.set(0, -0.15, 0);
+mapGroup.add(planeMesh);
+
+// globe representation (for 3d_globe_distance)
+const globeGroup = new THREE.Group();
+globeGroup.visible = false;
+mapGroup.add(globeGroup);
+
+const GLOBE_RADIUS = 0.34;
+const globeGeom = new THREE.SphereGeometry(GLOBE_RADIUS, 96, 64);
+const globeMat = new THREE.MeshStandardMaterial({
+  color: 0x6e94b2,
+  roughness: 0.58,
+  metalness: 0.0,
+  emissive: new THREE.Color(0x1a314a),
+  emissiveIntensity: 0.55
+});
+const globeMesh = new THREE.Mesh(globeGeom, globeMat);
+globeGroup.add(globeMesh);
+
+{
+  const loader = new THREE.TextureLoader();
+  loader.load(
+    'https://upload.wikimedia.org/wikipedia/commons/thumb/2/23/Blue_Marble_2002.png/2048px-Blue_Marble_2002.png',
+    (tex)=>{
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.anisotropy = 8;
+      globeMat.map = tex;
+      globeMat.needsUpdate = true;
+    },
+    undefined,
+    ()=>{ /* keep fallback color */ }
+  );
+}
+
+// subtle shadow plane
+const shadowGeom = new THREE.PlaneGeometry(1.2, 0.9);
+const shadowMat = new THREE.MeshBasicMaterial({ color: 0x000000, transparent:true, opacity:0.25 });
+const shadow = new THREE.Mesh(shadowGeom, shadowMat);
+shadow.rotation.x = -Math.PI/2;
+shadow.position.y = -0.55;
+scene.add(shadow);
+
+/** =========================
+ *  2) Study 1 数据 & 题目生成
+ *  ========================= */
+
+// CSV 数据源（支持矩阵格式和长表格式）
+const FLOW_CSV_PATH = './abel-database-s2.filtered.csv';
+const REGION_COORDS = {
+  'North America': {lat:45.0, lon:-100.0},
+  'Central America': {lat:15.0, lon:-90.0},
+  'South America': {lat:-15.0, lon:-60.0},
+  'North Africa': {lat:28.0, lon:10.0},
+  'Sub-Saharan Africa': {lat:0.0, lon:20.0},
+  'Northern Europe': {lat:58.0, lon:15.0},
+  'Western Europe': {lat:48.0, lon:2.0},
+  'Southern Europe': {lat:41.0, lon:15.0},
+  'Eastern Europe': {lat:50.0, lon:30.0},
+  'Central Asia': {lat:43.0, lon:68.0},
+  'Western Asia': {lat:33.0, lon:45.0},
+  'South Asia': {lat:22.0, lon:78.0},
+  'East Asia': {lat:35.0, lon:105.0},
+  'South-East Asia': {lat:8.0, lon:106.0},
+  'Oceania': {lat:-25.0, lon:135.0},
+};
+const LOCATION_CACHE = new Map();
+const COUNTRY_COORDS_BY_CODE = new Map();
+const STRICT_REAL_COORDS = true;
+const MANUAL_COORD_OVERRIDES_BY_CODE = {
+  CHI: {lat: 49.45, lon: -2.58},   // Channel Islands
+  GLP: {lat: 16.27, lon: -61.55},  // Guadeloupe
+  GUF: {lat: 4.94, lon: -52.33},   // French Guiana
+  MTQ: {lat: 14.64, lon: -61.02},  // Martinique
+  REU: {lat: -21.12, lon: 55.54},  // Reunion
+  MYT: {lat: -12.83, lon: 45.17},  // Mayotte
+  NCL: {lat: -22.27, lon: 166.46}, // New Caledonia
+  PYF: {lat: -17.54, lon: -149.57},// French Polynesia
+  VIR: {lat: 18.34, lon: -64.93},  // Virgin Islands
+  PSE: {lat: 31.95, lon: 35.20},   // Palestine
+};
+const MANUAL_COORD_OVERRIDES_BY_NAME = {
+  'Channel Islands': {lat: 49.45, lon: -2.58},
+  'French Guiana': {lat: 4.94, lon: -52.33},
+  'Virgin Islands': {lat: 18.34, lon: -64.93},
+  'Western Sahara': {lat: 24.00, lon: -13.00},
+  'Macedonia': {lat: 41.61, lon: 21.75},
+  'South Sudan': {lat: 4.85, lon: 31.60},
+  'Ivory Coast': {lat: 7.54, lon: -5.55},
+};
+let countryCoordsLoadPromise = null;
+
+async function ensureCountryCoordsLoaded(){
+  if(countryCoordsLoadPromise) return countryCoordsLoadPromise;
+  countryCoordsLoadPromise = (async ()=>{
+    try{
+      const res = await fetch('https://restcountries.com/v3.1/all?fields=cca3,latlng,name', {cache:'force-cache'});
+      if(!res.ok) throw new Error(`country coords fetch failed: ${res.status}`);
+      const data = await res.json();
+      for(const c of data){
+        const code = String(c?.cca3 || '').trim().toUpperCase();
+        const latlng = Array.isArray(c?.latlng) ? c.latlng : null;
+        if(!code || !latlng || latlng.length < 2) continue;
+        const lat = Number(latlng[0]);
+        const lon = Number(latlng[1]);
+        if(!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+        COUNTRY_COORDS_BY_CODE.set(code, {lat, lon});
+      }
+    }catch(err){
+      console.warn('Country coordinate map unavailable, using fallback mapping.', err);
+    }
+  })();
+  return countryCoordsLoadPromise;
+}
+
+function hashString32(s){
+  let h = 2166136261 >>> 0;
+  for(let i=0;i<s.length;i++){
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+function pseudoCoordFromCode(code){
+  const key = code || 'UNK';
+  const h1 = hashString32(key);
+  const h2 = hashString32(key + '_x');
+  const lon = (h1 / 4294967295) * 360 - 180;
+  const lat = (h2 / 4294967295) * 150 - 75; // avoid poles
+  return {lat, lon};
+}
+
+function resolveLocation(name, code=''){
+  if(name && REGION_COORDS[name]){
+    return {name, code, ...REGION_COORDS[name]};
+  }
+  const iso3 = String(code || '').trim().toUpperCase();
+  if(iso3 && MANUAL_COORD_OVERRIDES_BY_CODE[iso3]){
+    const p = MANUAL_COORD_OVERRIDES_BY_CODE[iso3];
+    return {name: name || iso3, code: iso3, lat: p.lat, lon: p.lon};
+  }
+  if(name && MANUAL_COORD_OVERRIDES_BY_NAME[name]){
+    const p = MANUAL_COORD_OVERRIDES_BY_NAME[name];
+    return {name, code: iso3 || code, lat: p.lat, lon: p.lon};
+  }
+  if(iso3 && COUNTRY_COORDS_BY_CODE.has(iso3)){
+    const real = COUNTRY_COORDS_BY_CODE.get(iso3);
+    return {name: name || iso3, code: iso3, lat: real.lat, lon: real.lon};
+  }
+  if(STRICT_REAL_COORDS) return null;
+  const k = `${code || name}`;
+  if(LOCATION_CACHE.has(k)) return LOCATION_CACHE.get(k);
+  const p = pseudoCoordFromCode(k);
+  const loc = {name: name || code || 'Unknown', code, lat: p.lat, lon: p.lon};
+  LOCATION_CACHE.set(k, loc);
+  return loc;
+}
+
+function splitCsvLine(line){
+  const out = [];
+  let cur = '';
+  let inQuotes = false;
+  for(let i=0; i<line.length; i++){
+    const ch = line[i];
+    if(ch === '"'){
+      if(inQuotes && line[i+1] === '"'){
+        cur += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if(ch === ',' && !inQuotes){
+      out.push(cur);
+      cur = '';
+    } else {
+      cur += ch;
+    }
+  }
+  out.push(cur);
+  return out;
+}
+
+function cleanCell(cell){
+  return String(cell || '').replace(/\uFEFF/g, '').trim();
+}
+
+function parseFlowValue(cell){
+  const s = cleanCell(cell).replace(/,/g, '');
+  const n = Number(s);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function sampleFlows(flows, n){
+  const arr = flows.slice();
+  for(let i=arr.length-1; i>0; i--){
+    const j = Math.floor(Math.random() * (i+1));
+    const tmp = arr[i];
+    arr[i] = arr[j];
+    arr[j] = tmp;
+  }
+  return arr.slice(0, Math.min(n, arr.length));
+}
+
+let allDatasetFlows = null;
+
+async function loadFlowsFromCSV(path = FLOW_CSV_PATH){
+  if(allDatasetFlows) return allDatasetFlows;
+  await ensureCountryCoordsLoaded();
+
+  const res = await fetch(path, { cache: 'no-cache' });
+  if(!res.ok) throw new Error(`CSV load failed: ${res.status}`);
+  const text = await res.text();
+  const lines = text.split(/\r?\n/).map(l=>l.trimEnd()).filter(l=>cleanCell(l).length>0);
+  if(lines.length < 2) throw new Error('CSV has insufficient rows');
+
+  const firstRow = splitCsvLine(lines[0]).map(cleanCell);
+  const flows = [];
+
+  // 长表格式：origin_name,origin_code,destination_name,destination_code,value
+  if(firstRow.includes('origin_name') && firstRow.includes('destination_name') && firstRow.includes('value')){
+    const idxOriginName = firstRow.indexOf('origin_name');
+    const idxOriginCode = firstRow.indexOf('origin_code');
+    const idxDestName = firstRow.indexOf('destination_name');
+    const idxDestCode = firstRow.indexOf('destination_code');
+    const idxValue = firstRow.indexOf('value');
+
+    for(let r=1; r<lines.length; r++){
+      const cols = splitCsvLine(lines[r]).map(cleanCell);
+      const originName = cols[idxOriginName] || '';
+      const originCode = (idxOriginCode>=0 ? cols[idxOriginCode] : '') || '';
+      const destName = cols[idxDestName] || '';
+      const destCode = (idxDestCode>=0 ? cols[idxDestCode] : '') || '';
+      if(!originName || !destName) continue;
+      if((originCode && destCode && originCode===destCode) || originName===destName) continue;
+      const value = parseFlowValue(cols[idxValue]);
+      if(value <= 0) continue;
+      const oLoc = resolveLocation(originName, originCode);
+      const dLoc = resolveLocation(destName, destCode);
+      if(!oLoc || !dLoc) continue;
+      flows.push({
+        o: oLoc,
+        d: dLoc,
+        value,
+      });
+    }
+  } else {
+    // 兼容旧矩阵格式
+    const destinations = firstRow.filter(Boolean);
+    for(let r=1; r<lines.length; r++){
+      const cols = splitCsvLine(lines[r]);
+      if(cols.length < 2) continue;
+      const originName = cleanCell(cols[0]);
+      if(!originName) continue;
+      for(let c=1; c<cols.length && c<=destinations.length; c++){
+        const destName = destinations[c-1];
+        if(!destName || destName === originName) continue;
+        const value = parseFlowValue(cols[c]);
+        if(value <= 0) continue;
+        const oLoc = resolveLocation(originName, originName.slice(0,3).toUpperCase());
+        const dLoc = resolveLocation(destName, destName.slice(0,3).toUpperCase());
+        if(!oLoc || !dLoc) continue;
+        flows.push({
+          o: oLoc,
+          d: dLoc,
+          value,
+        });
+      }
+    }
+  }
+
+  allDatasetFlows = flows;
+  return allDatasetFlows;
+}
+
+function computeStats(flows){
+  let vMin=Infinity, vMax=-Infinity, dMin=Infinity, dMax=-Infinity;
+  const pts = flows.map(f=>{
+    const p0 = hammerProject(f.o.lat, f.o.lon, 0.42);
+    const p3 = hammerProject(f.d.lat, f.d.lon, 0.42);
+    const dist = greatCircleDistanceKm(f.o.lat, f.o.lon, f.d.lat, f.d.lon);
+    vMin = Math.min(vMin, f.value);
+    vMax = Math.max(vMax, f.value);
+    dMin = Math.min(dMin, dist);
+    dMax = Math.max(dMax, dist);
+    return {p0,p3,dist};
+  });
+  return {vMin,vMax,dMin,dMax, pts};
+}
+
+/** =========================
+ *  3) Flow 渲染（五种条件）
+ *  ========================= */
+
+let flowGroup = new THREE.Group();
+let flowHost = planeMesh;
+flowHost.add(flowGroup);
+
+function setVisualizationMode(condition){
+  const globeMode = (condition === '3d_globe_distance');
+  planeMesh.visible = !globeMode;
+  shadow.visible = !globeMode;
+  globeGroup.visible = globeMode;
+
+  // 模式化亮度：globe 亮一些，平面恢复正常亮度
+  renderer.toneMappingExposure = globeMode ? 1.45 : 1.05;
+  ambient.intensity = globeMode ? 0.85 : 0.55;
+  dir.intensity = globeMode ? 0.9 : 0.75;
+  hemi.intensity = globeMode ? 0.7 : 0.18;
+  backDir.intensity = globeMode ? 0.55 : 0.08;
+  planeMat.emissiveIntensity = globeMode ? 0.15 : 0.10;
+
+  const nextHost = globeMode ? globeGroup : planeMesh;
+  if(nextHost !== flowHost){
+    flowHost.remove(flowGroup);
+    flowHost = nextHost;
+    flowHost.add(flowGroup);
+  }
+}
+
+function clearFlows(){
+  flowHost.remove(flowGroup);
+  flowGroup.traverse(obj=>{
+    if(obj.geometry) obj.geometry.dispose();
+    if(obj.material){
+      if(Array.isArray(obj.material)) obj.material.forEach(m=>m.dispose());
+      else obj.material.dispose();
+    }
+  });
+  flowGroup = new THREE.Group();
+  flowHost.add(flowGroup);
+}
+
+function mapToPlanePoint(p){
+  // 把 [-1,1] 的归一化坐标映射到 plane 本地坐标，留少量边距
+  const local = new THREE.Vector3(p.x, p.y, 0.002);
+  local.x *= MAP_W * 0.48;
+  local.y *= MAP_H * 0.48;
+  return local;
+}
+
+function latLonToGlobePoint(latDeg, lonDeg, radius=GLOBE_RADIUS){
+  const phi = (90 - latDeg) * Math.PI / 180;
+  const theta = (lonDeg + 180) * Math.PI / 180;
+  const x = -radius * Math.sin(phi) * Math.cos(theta);
+  const y = radius * Math.cos(phi);
+  const z = radius * Math.sin(phi) * Math.sin(theta);
+  return new THREE.Vector3(x, y, z);
+}
+
+function colorByDirection(t){
+  // 简单 red->green gradient
+  const r = lerp(1.0, 0.2, t);
+  const g = lerp(0.2, 1.0, t);
+  const b = 0.25;
+  return new THREE.Color(r, g, b);
+}
+
+function makeCurvePointsStraight(p0, p3, segments=40){
+  const pts = [];
+  for(let i=0;i<=segments;i++){
+    const t = i/segments;
+    pts.push(p0.clone().lerp(p3, t));
+  }
+  return pts;
+}
+
+// 2D routing: 基于控制点的 cubic Bézier 路由
+function makeBezierRouteCurve2D(p0, p3){
+  const dir = p3.clone().sub(p0);
+  const len = Math.max(1e-6, dir.length());
+  const u = dir.clone().multiplyScalar(1 / len);
+  const mid = p0.clone().lerp(p3, 0.5);
+
+  // 主偏移：朝“远离地图中心”方向绕行，减少中心区交叉
+  let outward = mid.clone();
+  outward.z = 0;
+  if(outward.lengthSq() < 1e-8){
+    outward = new THREE.Vector3(-u.y, u.x, 0);
+  } else {
+    outward.normalize();
+  }
+
+  // 次偏移：沿法向做小幅错层，避免完全重叠
+  const n = new THREE.Vector3(-u.y, u.x, 0);
+  const sideSign = Math.sign(n.dot(outward)) || 1;
+
+  const tangentLen = Math.min(len * 0.30, 0.18);
+  const outwardMag = Math.min(Math.max(len * 0.22, 0.020), 0.075);
+  const laneMag = Math.min(Math.max(len * 0.03, 0.003), 0.012);
+
+  const c1 = p0.clone()
+    .add(u.clone().multiplyScalar(tangentLen))
+    .add(outward.clone().multiplyScalar(outwardMag))
+    .add(n.clone().multiplyScalar(sideSign * laneMag));
+  const c2 = p3.clone()
+    .add(u.clone().multiplyScalar(-tangentLen))
+    .add(outward.clone().multiplyScalar(outwardMag))
+    .add(n.clone().multiplyScalar(sideSign * laneMag));
+  return new THREE.CubicBezierCurve3(p0, c1, c2, p3);
+}
+
+function makeArcBezierCurve(p0, p3, height){
+  // 在 plane 坐标系里做抬高：沿 plane 法线方向（这里就是 +z）抬高
+  // 用对称 cubic bezier，控制点投影在端点，z=hc
+  const h = height;
+  const hc = (4/3) * h;                     
+  const c1 = p0.clone(); c1.z += hc;
+  const c2 = p3.clone(); c2.z += hc;
+  return new THREE.CubicBezierCurve3(p0, c1, c2, p3);
+}
+
+function makeGlobeDistanceBezierCurve(p0, p3, height, radius=GLOBE_RADIUS){
+  // 严格保证在球体外：沿球面方向插值，并按 sin 曲线抬高
+  const a = p0.clone().normalize();
+  const b = p3.clone().normalize();
+  const dot = clamp01((a.dot(b) + 1) * 0.5) * 2 - 1;
+  const omega = Math.acos(Math.max(-1, Math.min(1, dot)));
+  const sinOmega = Math.sin(omega);
+  const segments = 120;
+  const points = [];
+  const baseLift = 0.006; // 端点略高于球面，避免 z-fighting / 埋入
+
+  for(let i=0; i<=segments; i++){
+    const t = i / segments;
+    let dir;
+    if(sinOmega < 1e-6){
+      dir = a.clone().lerp(b, t).normalize();
+    } else {
+      const s0 = Math.sin((1 - t) * omega) / sinOmega;
+      const s1 = Math.sin(t * omega) / sinOmega;
+      dir = a.clone().multiplyScalar(s0).add(b.clone().multiplyScalar(s1)).normalize();
+    }
+    const lift = baseLift + height * Math.sin(Math.PI * t);
+    points.push(dir.multiplyScalar(radius + lift));
+  }
+
+  return new THREE.CatmullRomCurve3(points, false, 'centripetal', 0.5);
+}
+
+function thicknessRadius(value, vMin, vMax, rMin=0.001, rMax=0.005){
+  // 对数缩放：压缩大值线宽，避免少数超大流量过粗
+  const range = Math.max(1, vMax - vMin);
+  const x = Math.max(0, value - vMin);
+  const t = Math.log1p(x) / Math.log1p(range);
+  return lerp(rMin, rMax, clamp01(t));
+}
+
+function heightByDistance(dist, dMin, dMax, hMin=0.05, hMax=0.25){
+  const t = clamp01((dist - dMin) / (dMax - dMin + 1e-9));
+  return lerp(hMin, hMax, t);
+}
+function heightByValue(value, vMin, vMax, hMin=0.05, hMax=0.25){
+  const t = clamp01((value - vMin) / (vMax - vMin + 1e-9));
+  return lerp(hMin, hMax, t);
+}
+
+function makeTubeFromPoints(points, radius, radialSeg=8){
+  const curve = new THREE.CatmullRomCurve3(points);
+  const tubularSeg = Math.max(20, points.length*2);
+  const geom = new THREE.TubeGeometry(curve, tubularSeg, radius, radialSeg, false);
+
+  // 用顶点色做沿线渐变（起点->终点）表示方向
+  const cols = [];
+  for(let i=0; i<=tubularSeg; i++){
+    const t = i / tubularSeg;
+    const c = colorByDirection(t);
+    for(let j=0; j<=radialSeg; j++){
+      cols.push(c.r, c.g, c.b);
+    }
+  }
+  geom.setAttribute('color', new THREE.Float32BufferAttribute(cols, 3));
+
+  const mat = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    vertexColors: true,
+    transparent: true,
+    opacity: 0.93,
+    roughness: 1.0,
+    metalness: 0.0
+  });
+  return new THREE.Mesh(geom, mat);
+}
+
+function makeTubeFromCurve(curve, radius, radialSeg=8, tubularSeg=120){
+  const geom = new THREE.TubeGeometry(curve, tubularSeg, radius, radialSeg, false);
+
+  const cols = [];
+  for(let i=0; i<=tubularSeg; i++){
+    const t = i / tubularSeg;
+    const c = colorByDirection(t);
+    for(let j=0; j<=radialSeg; j++){
+      cols.push(c.r, c.g, c.b);
+    }
+  }
+  geom.setAttribute('color', new THREE.Float32BufferAttribute(cols, 3));
+
+  const mat = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    vertexColors: true,
+    transparent: true,
+    opacity: 0.93,
+    roughness: 1.0,
+    metalness: 0.0
+  });
+  return new THREE.Mesh(geom, mat);
+}
+
+// 2D 直线 / 曲线：这里也用很薄的 tube（在视觉上等价“线”，且支持粗细编码）
+function makeThin2D(points, radius){
+  return makeTubeFromPoints(points, Math.max(0.0008, radius), 6);
+}
+
+// 渲染所有 flows（根据 condition）
+function renderFlows(flows, condition){
+  setVisualizationMode(condition);
+  clearFlows();
+  const {vMin,vMax,dMin,dMax} = computeStats(flows);
+
+  for(const f of flows){
+    const globeMode = (condition === '3d_globe_distance');
+    const P0 = globeMode
+      ? latLonToGlobePoint(f.o.lat, f.o.lon, GLOBE_RADIUS)
+      : mapToPlanePoint(hammerProject(f.o.lat, f.o.lon, 0.42));
+    const P3 = globeMode
+      ? latLonToGlobePoint(f.d.lat, f.d.lon, GLOBE_RADIUS)
+      : mapToPlanePoint(hammerProject(f.d.lat, f.d.lon, 0.42));
+    const dist = greatCircleDistanceKm(f.o.lat, f.o.lon, f.d.lat, f.d.lon);
+
+    // thickness
+    const rad = thicknessRadius(f.value, vMin, vMax);
+
+    // height (only for 3D conditions + 2D curve uses 0 height)
+    let height = 0.0;
+    if(condition === '3d_constant') height = 0.15;
+    if(condition === '3d_distance') height = heightByDistance(dist, dMin, dMax, 0.05, 0.25);
+    if(condition === '3d_quantity') height = heightByValue(f.value, vMin, vMax, 0.05, 0.25);
+    if(condition === '3d_globe_distance') height = heightByDistance(dist, dMin, dMax, 0.03, 0.16);
+
+    // points
+    let pts;
+    if(condition === '2d_straight'){
+      pts = makeCurvePointsStraight(P0, P3, 30);
+      const mesh = makeThin2D(pts, rad);
+      flowGroup.add(mesh);
+    } else if(condition === '2d_curve'){
+      const routeCurve = makeBezierRouteCurve2D(P0, P3);
+      const mesh = makeTubeFromCurve(routeCurve, Math.max(0.0008, rad), 6, 96);
+      flowGroup.add(mesh);
+    } else if(condition === '3d_globe_distance'){
+      const arcCurve = makeGlobeDistanceBezierCurve(P0, P3, height, GLOBE_RADIUS);
+      const tube = makeTubeFromCurve(arcCurve, Math.max(0.0007, rad * 0.8), 8, 120);
+      tube.material.opacity = 0.82;
+      tube.material.color.setRGB(0.78, 0.78, 0.78);
+      flowGroup.add(tube);
+    } else {
+      // 3D raised
+      const arcCurve = makeArcBezierCurve(P0, P3, height);
+      const tube = makeTubeFromCurve(arcCurve, rad, 8, 120);
+      flowGroup.add(tube);
+    }
+  }
+}
+
+function highlightTwoFlows(flows, idx1, idx2, condition){
+  // 重新渲染（简单起见），但让两条 flow 用更亮颜色
+  clearFlows();
+  const {vMin,vMax,dMin,dMax} = computeStats(flows);
+
+  flows.forEach((f, k)=>{
+    const P0 = mapToPlanePoint(hammerProject(f.o.lat, f.o.lon, 0.42));
+    const P3 = mapToPlanePoint(hammerProject(f.d.lat, f.d.lon, 0.42));
+    const dist = greatCircleDistanceKm(f.o.lat, f.o.lon, f.d.lat, f.d.lon);
+
+    const rad = thicknessRadius(f.value, vMin, vMax);
+
+    let height = 0.0;
+    if(condition === '3d_constant') height = 0.15;
+    if(condition === '3d_distance') height = heightByDistance(dist, dMin, dMax, 0.05, 0.25);
+    if(condition === '3d_quantity') height = heightByValue(f.value, vMin, vMax, 0.05, 0.25);
+
+    let pts, mesh;
+    const isHi = (k===idx1 || k===idx2);
+    const opacity = isHi ? 0.98 : 0.72;
+
+    if(condition === '2d_straight'){
+      pts = makeCurvePointsStraight(P0, P3, 30);
+      mesh = makeThin2D(pts, rad);
+      mesh.material.opacity = opacity;
+      mesh.material.emissive = new THREE.Color(isHi ? 0x332200 : 0x000000);
+      mesh.material.emissiveIntensity = isHi ? 0.6 : 0.0;
+      flowGroup.add(mesh);
+    } else if(condition === '2d_curve'){
+      const routeCurve = makeBezierRouteCurve2D(P0, P3);
+      mesh = makeTubeFromCurve(routeCurve, Math.max(0.0008, rad), 6, 96);
+      mesh.material.opacity = opacity;
+      mesh.material.emissive = new THREE.Color(isHi ? 0x332200 : 0x000000);
+      mesh.material.emissiveIntensity = isHi ? 0.6 : 0.0;
+      flowGroup.add(mesh);
+    } else {
+      const arcCurve = makeArcBezierCurve(P0, P3, height);
+      mesh = makeTubeFromCurve(arcCurve, rad, 8, 120);
+      mesh.material.opacity = opacity;
+      mesh.material.emissive = new THREE.Color(isHi ? 0x332200 : 0x000000);
+      mesh.material.emissiveIntensity = isHi ? 0.6 : 0.0;
+      flowGroup.add(mesh);
+    }
+  });
+}
+
+/** =========================
+ *  5) 实验流程：生成数据并渲染
+ *  ========================= */
+
+const ui = {
+  cond: document.getElementById('cond'),
+  flowCount: document.getElementById('flowCount'),
+  newTrialBtn: document.getElementById('newTrialBtn'),
+};
+
+const DEFAULT_N_FLOWS = 20;
+
+let current = {
+  flows: [],
+  condition: ui.cond.value,
+  flowCount: parseInt(ui.flowCount.value, 10) || DEFAULT_N_FLOWS,
+};
+
+async function buildTrial(){
+  current.condition = ui.cond.value;
+  current.flowCount = parseInt(ui.flowCount.value, 10) || DEFAULT_N_FLOWS;
+  const nFlows = current.flowCount;
+  try{
+    const datasetFlows = await loadFlowsFromCSV(FLOW_CSV_PATH);
+    current.flows = sampleFlows(datasetFlows, nFlows);
+  }catch(err){
+    console.error(err);
+    alert(`CSV 读取失败：${err.message}`);
+    return;
+  }
+  if(current.flows.length < 2){
+    alert('CSV 数据不足，无法生成题目（可能是严格真实坐标筛选后剩余过少）。');
+    return;
+  }
+
+  // 渲染
+  renderFlows(current.flows, current.condition);
+}
+
+// UI bindings
+ui.newTrialBtn.onclick = buildTrial;
+ui.flowCount.onchange = ()=>{
+  current.flowCount = parseInt(ui.flowCount.value, 10) || DEFAULT_N_FLOWS;
+  buildTrial();
+};
+ui.cond.onchange = ()=>{
+  current.condition = ui.cond.value;
+  if(current.flows.length) renderFlows(current.flows, current.condition);
+};
+
+// 初始渲染一个默认 trial
+buildTrial();
+
+/** =========================
+ *  6) 拖拽移动 mapGroup（模拟 VR 中“拿起地图”）
+ *  ========================= */
+let isDragging = false;
+let dragStart = {x:0,y:0};
+let mapStartPos = new THREE.Vector3();
+renderer.domElement.addEventListener('pointerdown', (e)=>{
+  // 仅当点在 UI 外面才触发
+  if(e.clientX < 390 && e.clientY < 520) return;
+  isDragging = true;
+  dragStart.x = e.clientX;
+  dragStart.y = e.clientY;
+  mapStartPos.copy(mapGroup.position);
+});
+window.addEventListener('pointermove', (e)=>{
+  if(!isDragging) return;
+  const dx = (e.clientX - dragStart.x) / innerWidth;
+  const dy = (e.clientY - dragStart.y) / innerHeight;
+  mapGroup.position.x = mapStartPos.x + dx * 1.2;
+  mapGroup.position.y = mapStartPos.y - dy * 1.0;
+});
+window.addEventListener('pointerup', ()=>{ isDragging = false; });
+
+/** =========================
+ *  7) 渲染循环 & resize
+ *  ========================= */
+function animate(){
+  requestAnimationFrame(animate);
+  controls.update();
+
+  // label 始终面向相机（Sprite 已默认 billboarding，但 leader line需要更新）
+  // 为简化：不实时更新 leader lines 的几何（可接受）
+  renderer.render(scene, camera);
+}
+animate();
+
+window.addEventListener('resize', ()=>{
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+</script>
+</body>
+</html>
