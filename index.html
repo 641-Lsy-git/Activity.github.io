@@ -25,8 +25,17 @@
     }
     button { cursor:pointer; font-weight:600; }
     button:hover { background: rgba(255,255,255,0.10); }
-    #row { display:flex; gap:8px; margin-top:8px; }
-    #row button { width: 50%; }
+    #compareResult {
+      margin-top: 10px;
+      padding: 8px 10px;
+      border-radius: 10px;
+      border: 1px solid rgba(255,255,255,0.14);
+      background: rgba(255,255,255,0.05);
+      color: #d8e6ff;
+      font-size: 12px;
+      line-height: 1.35;
+    }
+    #revealAnswerBtn { margin-top: 8px; }
   </style>
 </head>
 <body>
@@ -35,7 +44,7 @@
 <div id="ui">
   <h2>Study</h2>
 
-  <label>Flow 表示</label>
+  <label>Representation</label>
   <select id="cond">
     <option value="2d_straight">2D straight</option>
     <option value="2d_curve">2D curve</option>
@@ -45,7 +54,7 @@
     <option value="3d_globe_distance">3D globe (distance)</option>
   </select>
 
-  <label>Flow 数量</label>
+  <label>Amount</label>
   <select id="flowCount">
     <option value="20" selected>20</option>
     <option value="40">40</option>
@@ -53,9 +62,8 @@
     <option value="120">120</option>
   </select>
 
-  <div id="row">
-    <button id="newTrialBtn">New Trial</button>
-  </div>
+  <div id="compareResult">A→B / X→Y 比较结果会显示在这里</div>
+  <button id="revealAnswerBtn" type="button">Show Answer</button>
 </div>
 
 <script type="importmap">
@@ -606,18 +614,368 @@ function parseFlowValue(cell){
   return Number.isFinite(n) ? n : 0;
 }
 
-function sampleFlows(flows, n){
-  const arr = flows.slice();
-  for(let i=arr.length-1; i>0; i--){
-    const j = Math.floor(Math.random() * (i+1));
-    const tmp = arr[i];
-    arr[i] = arr[j];
-    arr[j] = tmp;
+function endpointKey(loc){
+  return `${String(loc.code || '').toUpperCase()}|${String(loc.name || '')}`;
+}
+
+function flowStableKey(f){
+  return `${endpointKey(f.o)}->${endpointKey(f.d)}|${f.value}`;
+}
+
+function flowDistanceKm(f){
+  return greatCircleDistanceKm(f.o.lat, f.o.lon, f.d.lat, f.d.lon);
+}
+
+function buildPairCandidates(entries, opts = {}){
+  if(entries.length < 2) return [{score: 0, i1: 0, i2: 1}];
+  const sortedByValue = entries.slice().sort((a,b)=>a.value - b.value || a.dist - b.dist || a.idx - b.idx);
+  const candidates = [];
+  const windowSize = opts.windowSize ?? 120;
+  const minValueRatio = opts.minValueRatio ?? 1.40;
+  const maxValueRatio = opts.maxValueRatio ?? 2.40;
+  const maxDistRatio = opts.maxDistRatio ?? 2.2;
+  const targetValueRatio = opts.targetValueRatio ?? 1.70;
+  const minAbsDiff = opts.minAbsDiff ?? 800;
+  const maxAbsDiff = opts.maxAbsDiff ?? 1300;
+  const targetAbsDiff = opts.targetAbsDiff ?? 1000;
+  const endpointCountByKey = opts.endpointCountByKey || null;
+  const hubSoftLimit = opts.hubSoftLimit ?? Infinity;
+  const hubPenaltyWeight = opts.hubPenaltyWeight ?? 0.35;
+  const lowerTrimRatio = Math.max(0, Math.min(0.25, opts.lowerTrimRatio ?? 0.05));
+  const upperTrimRatio = Math.max(0, Math.min(0.25, opts.upperTrimRatio ?? 0.05));
+  const minValueAbs = opts.minValueAbs ?? -Infinity;
+  const maxValueAbs = opts.maxValueAbs ?? Infinity;
+  const outsideRangePenalty = opts.outsideRangePenalty ?? 4.0;
+
+  const allowedIdx = new Set();
+  const trimLow = Math.floor(sortedByValue.length * lowerTrimRatio);
+  const trimHigh = Math.floor(sortedByValue.length * upperTrimRatio);
+  const start = Math.min(trimLow, sortedByValue.length - 1);
+  const end = Math.max(start, sortedByValue.length - trimHigh);
+  for(let i=start; i<end; i++){
+    allowedIdx.add(sortedByValue[i].idx);
   }
-  return arr.slice(0, Math.min(n, arr.length));
+  // 数据太少时回退到全量，避免无候选
+  if(allowedIdx.size < 2){
+    allowedIdx.clear();
+    for(const e of entries) allowedIdx.add(e.idx);
+  }
+
+  for(let i=0; i<sortedByValue.length; i++){
+    const a = sortedByValue[i];
+    if(!allowedIdx.has(a.idx)) continue;
+    for(let j=i+1; j<Math.min(sortedByValue.length, i + windowSize); j++){
+      const b = sortedByValue[j];
+      if(!allowedIdx.has(b.idx)) continue;
+      if(endpointKey(a.flow.o) === endpointKey(b.flow.o)) continue;
+      if(endpointKey(a.flow.o) === endpointKey(b.flow.d)) continue;
+      if(endpointKey(a.flow.d) === endpointKey(b.flow.o)) continue;
+      if(endpointKey(a.flow.d) === endpointKey(b.flow.d)) continue;
+
+      const valueRatio = Math.max(a.value, b.value) / Math.max(1e-9, Math.min(a.value, b.value));
+      const distRatio = Math.max(a.dist, b.dist) / Math.max(1e-9, Math.min(a.dist, b.dist));
+      const absDiff = Math.abs(a.value - b.value);
+      if(valueRatio < minValueRatio || valueRatio > maxValueRatio) continue;
+      if(distRatio > maxDistRatio) continue;
+      if(absDiff < minAbsDiff || absDiff > maxAbsDiff) continue;
+
+      const distGap = Math.abs(Math.log(distRatio));
+      const targetValueGap = Math.abs(Math.log(valueRatio) - Math.log(targetValueRatio));
+      const targetAbsDiffGap = Math.abs(absDiff - targetAbsDiff) / Math.max(1, targetAbsDiff);
+      let hubPenalty = 0;
+      if(endpointCountByKey){
+        const c1 = endpointCountByKey.get(endpointKey(a.flow.o)) || 0;
+        const c2 = endpointCountByKey.get(endpointKey(a.flow.d)) || 0;
+        const c3 = endpointCountByKey.get(endpointKey(b.flow.o)) || 0;
+        const c4 = endpointCountByKey.get(endpointKey(b.flow.d)) || 0;
+        const maxHub = Math.max(c1, c2, c3, c4);
+        if(maxHub > hubSoftLimit) hubPenalty += (maxHub - hubSoftLimit) * hubPenaltyWeight;
+        const avgHub = (c1 + c2 + c3 + c4) * 0.25;
+        hubPenalty += avgHub * (hubPenaltyWeight * 0.15);
+      }
+      let valueRangePenalty = 0;
+      if(a.value < minValueAbs || a.value > maxValueAbs) valueRangePenalty += outsideRangePenalty;
+      if(b.value < minValueAbs || b.value > maxValueAbs) valueRangePenalty += outsideRangePenalty;
+      const score = targetAbsDiffGap * 1.7 + targetValueGap * 0.45 + distGap * 0.55 + hubPenalty + valueRangePenalty;
+      candidates.push({score, i1: a.idx, i2: b.idx});
+    }
+  }
+  if(candidates.length){
+    candidates.sort((u,v)=>u.score - v.score || u.i1 - v.i1 || u.i2 - v.i2);
+    return candidates;
+  }
+
+  // fallback: pick pair closest to targetAbsDiff (instead of first match)
+  const fallbackMinValueRatio = opts.fallbackMinValueRatio ?? 1.3;
+  let bestFallback = null;
+  for(let pass=0; pass<2; pass++){
+    const onlyInAbsRange = (pass === 0);
+    for(let i=0; i<entries.length; i++){
+      if(!allowedIdx.has(entries[i].idx)) continue;
+      if(onlyInAbsRange && (entries[i].value < minValueAbs || entries[i].value > maxValueAbs)) continue;
+      for(let j=i+1; j<entries.length; j++){
+        if(!allowedIdx.has(entries[j].idx)) continue;
+        if(onlyInAbsRange && (entries[j].value < minValueAbs || entries[j].value > maxValueAbs)) continue;
+        const a = entries[i].flow;
+        const b = entries[j].flow;
+        if(endpointKey(a.o) === endpointKey(b.o)) continue;
+        if(endpointKey(a.o) === endpointKey(b.d)) continue;
+        if(endpointKey(a.d) === endpointKey(b.o)) continue;
+        if(endpointKey(a.d) === endpointKey(b.d)) continue;
+        const valueRatio = Math.max(a.value, b.value) / Math.max(1e-9, Math.min(a.value, b.value));
+        if(valueRatio < fallbackMinValueRatio) continue;
+        const absDiff = Math.abs(entries[i].value - entries[j].value);
+        const targetAbsDiffGap = Math.abs(absDiff - targetAbsDiff) / Math.max(1, targetAbsDiff);
+        const ratioGap = Math.abs(Math.log(valueRatio) - Math.log(targetValueRatio));
+        const score = targetAbsDiffGap * 2.0 + ratioGap * 0.3 + (onlyInAbsRange ? 0 : 0.6);
+        if(!bestFallback || score < bestFallback.score){
+          bestFallback = {score, i1: entries[i].idx, i2: entries[j].idx};
+        }
+      }
+    }
+    if(bestFallback) return [bestFallback];
+  }
+  if(bestFallback) return [bestFallback];
+  return [{score: 1e9, i1: 0, i2: 1}];
+}
+
+function pairSignature(i1, i2){
+  const a = Math.min(i1, i2);
+  const b = Math.max(i1, i2);
+  return `${a}|${b}`;
+}
+
+function selectBalancedPair(entries, opts = {}, usedPairs = null){
+  const candidates = buildPairCandidates(entries, opts);
+  if(!candidates.length) return [0, 1];
+
+  const seedKey = String(opts.seedKey || 'default');
+  const seed = hashString32(seedKey);
+  const takeTop = Math.min(24, candidates.length);
+  const ranked = candidates.slice(0, takeTop);
+  const offset = seed % takeTop;
+
+  for(let k=0; k<ranked.length; k++){
+    const c = ranked[(k + offset) % ranked.length];
+    const sig = pairSignature(c.i1, c.i2);
+    if(!usedPairs || !usedPairs.has(sig)) return [c.i1, c.i2];
+  }
+  const pick = ranked[offset];
+  return [pick.i1, pick.i2];
+}
+
+function buildDeterministicFlowPool(flows){
+  if(!flows || flows.length === 0) return [];
+  const base = flows.slice().sort((a,b)=>{
+    const ka = flowStableKey(a);
+    const kb = flowStableKey(b);
+    return ka < kb ? -1 : (ka > kb ? 1 : 0);
+  });
+  return base;
+}
+
+function sampleFlows(flows, n){
+  const arr = flows.slice(0, Math.min(n, flows.length));
+  return arr;
+}
+
+function buildUniformMasterPool(basePool, maxN){
+  if(!basePool || basePool.length === 0) return [];
+  const total = Math.min(maxN, basePool.length);
+  if(total <= 0) return [];
+  if(total >= basePool.length) return basePool.slice();
+
+  const points = basePool.map((f, idx)=>{
+    const po = hammerProject(f.o.lat, f.o.lon);
+    const pd = hammerProject(f.d.lat, f.d.lon);
+    return {
+      idx,
+      x: (po.x + pd.x) * 0.5,
+      y: (po.y + pd.y) * 0.5,
+    };
+  });
+
+  const selected = [];
+  const selectedSet = new Set();
+  const minD2 = new Array(points.length).fill(Infinity);
+  let seedIdx = hashString32('uniform-master-pool-seed') % points.length;
+  selected.push(seedIdx);
+  selectedSet.add(seedIdx);
+
+  for(let k=1; k<total; k++){
+    const last = points[seedIdx];
+    for(let i=0; i<points.length; i++){
+      if(selectedSet.has(i)) continue;
+      const dx = points[i].x - last.x;
+      const dy = points[i].y - last.y;
+      const d2 = dx*dx + dy*dy;
+      if(d2 < minD2[i]) minD2[i] = d2;
+    }
+    let bestIdx = -1;
+    let bestScore = -1;
+    for(let i=0; i<points.length; i++){
+      if(selectedSet.has(i)) continue;
+      if(minD2[i] > bestScore){
+        bestScore = minD2[i];
+        bestIdx = i;
+      }
+    }
+    if(bestIdx < 0) break;
+    selected.push(bestIdx);
+    selectedSet.add(bestIdx);
+    seedIdx = bestIdx;
+  }
+
+  return selected.map(i=>basePool[i]);
+}
+
+function quantile(sorted, q){
+  if(!sorted.length) return 0;
+  const t = Math.max(0, Math.min(1, q));
+  const idx = Math.floor((sorted.length - 1) * t);
+  return sorted[idx];
+}
+
+function buildReselectedPool(basePool, targetN){
+  if(!basePool || basePool.length === 0) return [];
+  if(basePool.length <= targetN) return basePool.slice();
+
+  const byValue = basePool.slice().sort((a,b)=>a.value - b.value);
+  const bins = 8;
+  const buckets = Array.from({length: bins}, ()=>[]);
+  for(let i=0; i<byValue.length; i++){
+    const bi = Math.min(bins - 1, Math.floor(i * bins / byValue.length));
+    buckets[bi].push(byValue[i]);
+  }
+
+  // 每个桶内再按 endpoint key 稳定排序，保证可复现
+  for(const bucket of buckets){
+    bucket.sort((a,b)=>{
+      const ka = flowStableKey(a);
+      const kb = flowStableKey(b);
+      return ka < kb ? -1 : (ka > kb ? 1 : 0);
+    });
+  }
+
+  const out = [];
+  const offsets = buckets.map((bucket, i)=>bucket.length ? (hashString32(`reselect:${i}`) % bucket.length) : 0);
+  let k = 0;
+  while(out.length < targetN){
+    const bi = k % bins;
+    const bucket = buckets[bi];
+    if(bucket.length){
+      const idx = offsets[bi] % bucket.length;
+      out.push(bucket[idx]);
+      offsets[bi] += 1;
+    }
+    k++;
+    if(k > targetN * bins * 3) break;
+  }
+
+  if(out.length < targetN){
+    const used = new Set(out.map(flowStableKey));
+    for(const f of basePool){
+      const key = flowStableKey(f);
+      if(used.has(key)) continue;
+      out.push(f);
+      used.add(key);
+      if(out.length >= targetN) break;
+    }
+  }
+  return out.slice(0, targetN);
+}
+
+function buildFlowSetsByCount(basePool){
+  const presets = [20, 40, 80, 120];
+  const maxN = Math.max(...presets);
+  const reselected = buildReselectedPool(basePool, Math.min(basePool.length, maxN * 2));
+  const master = buildUniformMasterPool(reselected, maxN);
+  const fallbackMaster = buildUniformMasterPool(basePool, maxN);
+
+  function hasEnoughPairs(flows){
+    if(!flows || flows.length < 2) return false;
+    let c = 0;
+    for(let i=0; i<flows.length; i++){
+      for(let j=i+1; j<flows.length; j++){
+        const diff = Math.abs(flows[i].value - flows[j].value);
+        if(diff >= 650 && diff <= 1400){
+          c++;
+          if(c >= 6) return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  const map = new Map();
+  for(const n of presets){
+    // 同一均匀主池的前缀，不随数量切换而重排地点
+    const primary = sampleFlows(master, n);
+    map.set(n, hasEnoughPairs(primary) ? primary : sampleFlows(fallbackMaster, n));
+  }
+  return map;
+}
+
+function buildABXYPairsByMapType(flowSetsByCount){
+  const presets = [20, 40, 80, 120];
+  const conditions = ['2d_straight','2d_curve','3d_constant','3d_quantity','3d_distance','3d_globe_distance'];
+  const map = new Map();
+  for(const n of presets){
+    const flowSet = flowSetsByCount.get(n) || [];
+    const endpointCountByKey = new Map();
+    for(const f of flowSet){
+      const ok = endpointKey(f.o);
+      const dk = endpointKey(f.d);
+      endpointCountByKey.set(ok, (endpointCountByKey.get(ok) || 0) + 1);
+      endpointCountByKey.set(dk, (endpointCountByKey.get(dk) || 0) + 1);
+    }
+    const endpointCounts = Array.from(endpointCountByKey.values()).sort((a,b)=>a-b);
+    const p80 = endpointCounts.length
+      ? endpointCounts[Math.floor((endpointCounts.length - 1) * 0.8)]
+      : Infinity;
+
+    const entries = flowSet.map((flow, idx)=>({
+      idx,
+      flow,
+      value: Math.max(1e-9, flow.value),
+      dist: Math.max(1e-9, flowDistanceKm(flow)),
+    }));
+    const usedPairs = new Set();
+    for(const cond of conditions){
+      const key = `${cond}|${n}`;
+      const ratioShift = (hashString32(`ratio:${key}`) % 40) / 100;
+      const absShift = (hashString32(`abs:${key}`) % 220) - 110; // -110 ~ +109
+      const targetValueRatio = 1.60 + (ratioShift - 0.20) * 0.10;
+      const pair = selectBalancedPair(entries, {
+        seedKey: `pair:${key}`,
+        minValueRatio: 1.25,
+        maxValueRatio: 2.30,
+        maxDistRatio: 2.25,
+        targetValueRatio,
+        minAbsDiff: 550,
+        maxAbsDiff: 1050,
+        targetAbsDiff: 800 + Math.floor(absShift * 0.2),
+        fallbackMinValueRatio: 1.15,
+        lowerTrimRatio: 0.03,
+        upperTrimRatio: 0.03,
+        minValueAbs: 500,
+        maxValueAbs: 5000,
+        outsideRangePenalty: 8.0,
+        endpointCountByKey,
+        hubSoftLimit: p80,
+        hubPenaltyWeight: 0.55
+      }, usedPairs);
+      usedPairs.add(pairSignature(pair[0], pair[1]));
+      map.set(key, pair);
+    }
+  }
+  return map;
 }
 
 let allDatasetFlows = null;
+let deterministicFlowPool = null;
+let fixedFlowSetsByCount = null;
+let abxyPairsByMapType = null;
 
 async function loadFlowsFromCSV(path = FLOW_CSV_PATH){
   if(allDatasetFlows) return allDatasetFlows;
@@ -685,6 +1043,9 @@ async function loadFlowsFromCSV(path = FLOW_CSV_PATH){
   }
 
   allDatasetFlows = flows;
+  deterministicFlowPool = null;
+  fixedFlowSetsByCount = null;
+  abxyPairsByMapType = null;
   return allDatasetFlows;
 }
 
@@ -710,6 +1071,10 @@ function computeStats(flows){
 let flowGroup = new THREE.Group();
 let flowHost = planeMesh;
 flowHost.add(flowGroup);
+let labelGroup = new THREE.Group();
+let labelHost = planeMesh;
+labelHost.add(labelGroup);
+const activeLabelSprites = [];
 
 function setVisualizationMode(condition){
   const globeMode = (condition === '3d_globe_distance');
@@ -731,6 +1096,11 @@ function setVisualizationMode(condition){
     flowHost = nextHost;
     flowHost.add(flowGroup);
   }
+  if(nextHost !== labelHost){
+    labelHost.remove(labelGroup);
+    labelHost = nextHost;
+    labelHost.add(labelGroup);
+  }
 }
 
 function clearFlows(){
@@ -744,6 +1114,144 @@ function clearFlows(){
   });
   flowGroup = new THREE.Group();
   flowHost.add(flowGroup);
+}
+
+function clearEndpointLabels(){
+  labelHost.remove(labelGroup);
+  labelGroup.traverse(obj=>{
+    if(obj.material){
+      const materials = Array.isArray(obj.material) ? obj.material : [obj.material];
+      for(const m of materials){
+        if(m.map) m.map.dispose();
+        m.dispose();
+      }
+    }
+    if(obj.geometry) obj.geometry.dispose();
+  });
+  labelGroup = new THREE.Group();
+  labelHost.add(labelGroup);
+  activeLabelSprites.length = 0;
+}
+
+function makeTextSprite(text, color='#ffffff'){
+  const c = document.createElement('canvas');
+  c.width = 256;
+  c.height = 128;
+  const g = c.getContext('2d');
+  g.clearRect(0, 0, c.width, c.height);
+  g.font = 'bold 74px ui-sans-serif, system-ui';
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  g.lineWidth = 10;
+  g.strokeStyle = 'rgba(0,0,0,0.78)';
+  g.strokeText(text, c.width * 0.5, c.height * 0.54);
+  g.fillStyle = color;
+  g.fillText(text, c.width * 0.5, c.height * 0.54);
+
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.needsUpdate = true;
+  const mat = new THREE.SpriteMaterial({
+    map: tex,
+    transparent: true,
+    depthTest: false,
+    depthWrite: false
+  });
+  const sprite = new THREE.Sprite(mat);
+  sprite.renderOrder = 2200;
+  return sprite;
+}
+
+function endpointPointForLabel(flowEnd, globeMode){
+  if(globeMode){
+    const p = latLonToGlobePoint(flowEnd.lat, flowEnd.lon, GLOBE_RADIUS);
+    const n = p.clone().normalize();
+    return p.addScaledVector(n, 0.010);
+  }
+  const p = mapToPlanePoint(hammerProject(flowEnd.lat, flowEnd.lon, 0.42));
+  p.z += 0.004;
+  return p;
+}
+
+function makeEndpointCircle(color, globeMode){
+  if(globeMode){
+    const geom = new THREE.SphereGeometry(0.010, 24, 18);
+    const mat = new THREE.MeshBasicMaterial({ color, depthTest: false, depthWrite: false });
+    const mesh = new THREE.Mesh(geom, mat);
+    mesh.renderOrder = 2100;
+    return mesh;
+  }
+  const geom = new THREE.CircleGeometry(0.012, 28);
+  const mat = new THREE.MeshBasicMaterial({
+    color,
+    side: THREE.DoubleSide,
+    depthTest: false,
+    depthWrite: false
+  });
+  const mesh = new THREE.Mesh(geom, mat);
+  mesh.renderOrder = 2100;
+  return mesh;
+}
+
+function addEndpointLabel(text, flowEnd, globeMode, color){
+  const anchor = endpointPointForLabel(flowEnd, globeMode);
+  const marker = makeEndpointCircle(color, globeMode);
+  marker.position.copy(anchor);
+  labelGroup.add(marker);
+
+  const sprite = makeTextSprite(text, color);
+  if(globeMode){
+    const normal = anchor.clone().normalize();
+    sprite.position.copy(anchor).addScaledVector(normal, 0.022);
+    const s = 0.050;
+    sprite.scale.set(s, s * 0.52, 1);
+  } else {
+    sprite.position.copy(anchor);
+    sprite.position.z += 0.016;
+    const s = 0.064;
+    sprite.scale.set(s, s * 0.52, 1);
+  }
+  labelGroup.add(sprite);
+  activeLabelSprites.push(sprite);
+}
+
+function normalizeABXYPair(flows, pair){
+  if(!flows || flows.length < 2) return [0, 1];
+  const maxIdx = flows.length - 1;
+  const i0 = Math.max(0, Math.min(maxIdx, Number(pair?.[0] ?? 0)));
+  let i1 = Math.max(0, Math.min(maxIdx, Number(pair?.[1] ?? 1)));
+  if(i1 === i0) i1 = (i0 + 1) % flows.length;
+  return [i0, i1];
+}
+
+function updateABXYLabels(flows, condition, pair){
+  clearEndpointLabels();
+  if(!flows || flows.length < 2) return;
+  const [iAB, iXY] = normalizeABXYPair(flows, pair);
+  const globeMode = (condition === '3d_globe_distance');
+  const fAB = flows[iAB];
+  const fXY = flows[iXY];
+  addEndpointLabel('A', fAB.o, globeMode, '#ffe09a');
+  addEndpointLabel('B', fAB.d, globeMode, '#ffe09a');
+  addEndpointLabel('X', fXY.o, globeMode, '#a6e2ff');
+  addEndpointLabel('Y', fXY.d, globeMode, '#a6e2ff');
+}
+
+function updateABXYComparison(flows, pair){
+  if(!ui.compareResult) return '';
+  if(!flows || flows.length < 2){
+    ui.compareResult.textContent = 'A→B / X→Y 数据不足';
+    return ui.compareResult.textContent;
+  }
+  const [iAB, iXY] = normalizeABXYPair(flows, pair);
+  const ab = flows[iAB].value;
+  const xy = flows[iXY].value;
+  let greater = 'Equal';
+  if(ab > xy) greater = 'A→B';
+  if(xy > ab) greater = 'X→Y';
+  const answer = `A→B=${ab.toLocaleString()} | X→Y=${xy.toLocaleString()} | Greater: ${greater}`;
+  ui.compareResult.textContent = answer;
+  return answer;
 }
 
 function mapToPlanePoint(p){
@@ -853,12 +1361,14 @@ function makeGlobeDistanceBezierCurve(p0, p3, height, radius=GLOBE_RADIUS){
   return new THREE.CatmullRomCurve3(points, false, 'centripetal', 0.5);
 }
 
-function thicknessRadius(value, vMin, vMax, rMin=0.001, rMax=0.005){
-  // 对数缩放：压缩大值线宽，避免少数超大流量过粗
-  const range = Math.max(1, vMax - vMin);
-  const x = Math.max(0, value - vMin);
-  const t = Math.log1p(x) / Math.log1p(range);
-  return lerp(rMin, rMax, clamp01(t));
+function thicknessRadius(value, vMin, vMax, rMin=0.0022, rMax=0.0105){
+  // 基于清洗后值域（500~3000）重新映射，并按当前样本动态拉伸
+  const domainMin = Math.max(500, Math.min(vMin, 3000));
+  const domainMax = Math.min(3000, Math.max(vMax, 500));
+  const span = Math.max(1e-9, domainMax - domainMin);
+  const tRaw = clamp01((value - domainMin) / span);
+  const t = Math.pow(tRaw, 1.05);
+  return lerp(rMin, rMax, t);
 }
 
 function heightByDistance(dist, dMin, dMax, hMin=0.05, hMax=0.25){
@@ -1030,7 +1540,8 @@ function highlightTwoFlows(flows, idx1, idx2, condition){
 const ui = {
   cond: document.getElementById('cond'),
   flowCount: document.getElementById('flowCount'),
-  newTrialBtn: document.getElementById('newTrialBtn'),
+  compareResult: document.getElementById('compareResult'),
+  revealAnswerBtn: document.getElementById('revealAnswerBtn'),
 };
 
 const DEFAULT_N_FLOWS = 20;
@@ -1039,7 +1550,21 @@ let current = {
   flows: [],
   condition: ui.cond.value,
   flowCount: parseInt(ui.flowCount.value, 10) || DEFAULT_N_FLOWS,
+  abxyPair: [0, 1],
+  answerText: '',
+  answerRevealed: false,
 };
+
+function refreshAnswerPanel(){
+  if(!ui.compareResult || !ui.revealAnswerBtn) return;
+  if(current.answerRevealed){
+    ui.compareResult.textContent = current.answerText || 'No answer';
+    ui.revealAnswerBtn.textContent = 'Hide Answer';
+  } else {
+    ui.compareResult.textContent = 'Answer hidden. Click "Show Answer".';
+    ui.revealAnswerBtn.textContent = 'Show Answer';
+  }
+}
 
 async function buildTrial(){
   current.condition = ui.cond.value;
@@ -1047,7 +1572,15 @@ async function buildTrial(){
   const nFlows = current.flowCount;
   try{
     const datasetFlows = await loadFlowsFromCSV(FLOW_CSV_PATH);
-    current.flows = sampleFlows(datasetFlows, nFlows);
+    if(!deterministicFlowPool || deterministicFlowPool.length !== datasetFlows.length){
+      deterministicFlowPool = buildDeterministicFlowPool(datasetFlows);
+      fixedFlowSetsByCount = buildFlowSetsByCount(deterministicFlowPool);
+      abxyPairsByMapType = buildABXYPairsByMapType(fixedFlowSetsByCount);
+    }
+    const fixed = fixedFlowSetsByCount?.get(nFlows);
+    current.flows = fixed ? fixed.slice() : sampleFlows(deterministicFlowPool, nFlows);
+    const mapKey = `${current.condition}|${nFlows}`;
+    current.abxyPair = (abxyPairsByMapType?.get(mapKey) || [0, 1]).slice();
   }catch(err){
     console.error(err);
     alert(`CSV 读取失败：${err.message}`);
@@ -1060,18 +1593,27 @@ async function buildTrial(){
 
   // 渲染
   renderFlows(current.flows, current.condition);
+  updateABXYLabels(current.flows, current.condition, current.abxyPair);
+  current.answerText = updateABXYComparison(current.flows, current.abxyPair);
+  current.answerRevealed = false;
+  refreshAnswerPanel();
 }
 
 // UI bindings
-ui.newTrialBtn.onclick = buildTrial;
 ui.flowCount.onchange = ()=>{
   current.flowCount = parseInt(ui.flowCount.value, 10) || DEFAULT_N_FLOWS;
   buildTrial();
 };
 ui.cond.onchange = ()=>{
   current.condition = ui.cond.value;
-  if(current.flows.length) renderFlows(current.flows, current.condition);
+  buildTrial();
 };
+if(ui.revealAnswerBtn){
+  ui.revealAnswerBtn.onclick = ()=>{
+    current.answerRevealed = !current.answerRevealed;
+    refreshAnswerPanel();
+  };
+}
 
 // 初始渲染一个默认 trial
 buildTrial();
@@ -1106,8 +1648,9 @@ function animate(){
   requestAnimationFrame(animate);
   controls.update();
 
-  // label 始终面向相机（Sprite 已默认 billboarding，但 leader line需要更新）
-  // 为简化：不实时更新 leader lines 的几何（可接受）
+  for(const s of activeLabelSprites){
+    s.quaternion.copy(camera.quaternion);
+  }
   renderer.render(scene, camera);
 }
 animate();
